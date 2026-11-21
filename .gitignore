@@ -1,0 +1,23 @@
+# Plaintext test passwords - never commit
+passwords.txt
+
+# SSH host keys (generate locally with ssh-keygen, see README)
+server/ssh_host_ed25519_key
+server/ssh_host_ed25519_key.pub
+
+# Runtime output
+server/audit.jsonl
+server/sftp_root/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
