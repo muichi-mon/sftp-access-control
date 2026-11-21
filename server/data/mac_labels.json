@@ -1,0 +1,16 @@
+{
+  "levels": ["public", "internal", "confidential"],
+  "labels": {
+    "/": "internal",
+    "/public": "public",
+    "/projects": "internal",
+    "/projects/confidential": "confidential",
+    "/admin": "internal"
+  },
+  "users": {
+    "alice": "internal",
+    "bob": "internal",
+    "carol": "confidential",
+    "eve": "public"
+  }
+}

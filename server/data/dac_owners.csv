@@ -1,0 +1,6 @@
+prefix,owner,group,dir_mode,file_mode
+/,bob,admin,755,644
+/public,bob,admin,755,644
+/projects,alice,analyst,770,660
+/projects/confidential,carol,analyst,770,660
+/admin,bob,admin,770,660

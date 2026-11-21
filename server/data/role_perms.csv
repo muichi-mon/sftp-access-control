@@ -1,0 +1,5 @@
+role,prefix,read,write,delete
+admin,/,y,y,y
+analyst,/projects,y,y,
+analyst,/public,y,,
+guest,/public,y,,

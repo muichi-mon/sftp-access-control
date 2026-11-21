@@ -1,0 +1,38 @@
+[
+  {
+    "username": "alice",
+    "salt": "/kCFPJSZENIZDoyriUyLyQ==",
+    "password_hash": "scJdqcUC+y+v4YubLiSdX2CQifi63uJsxR9rZKWIcco=",
+    "n": 16384,
+    "r": 8,
+    "p": 1,
+    "dklen": 32
+  },
+  {
+    "username": "bob",
+    "salt": "Fl5gv3qU/oUlRvvt3sYj+Q==",
+    "password_hash": "tE+uEx7v2RLPJai3hirvyxZ5WmfkSfWyPlMzgpZLLJk=",
+    "n": 16384,
+    "r": 8,
+    "p": 1,
+    "dklen": 32
+  },
+  {
+    "username": "carol",
+    "salt": "cKM+4+2e8RVLIgCzQkUZVA==",
+    "password_hash": "i1Jo082A5DXIKh0nqmzu5+craP17/f1GTgmZ45KLnKA=",
+    "n": 16384,
+    "r": 8,
+    "p": 1,
+    "dklen": 32
+  },
+  {
+    "username": "eve",
+    "salt": "QCGZUWfWnvot1s6i37AFUQ==",
+    "password_hash": "BcSsMXmvM8zEWFCr7lck33vbqrIs1xLkNVw/IlyHVDw=",
+    "n": 16384,
+    "r": 8,
+    "p": 1,
+    "dklen": 32
+  }
+]
