@@ -11,11 +11,11 @@ server/
   loader.py      reads and checks the data files at startup
   policy.py      authorize(): DAC, MAC, RBAC
   data/          the static users, roles, labels and owners
-  sftp_root/     the jail (created when the server runs)
+  sftp_root/     the jail (created at runtime; initially empty)
 client/client.py SFTP client
-tests/           pytest tests
+tests/test_sftp.py  pytest tests
 ctf/             flag setup
-docs/            CTF_writeup.pdf
+CTF_writeup.pdf  CTF write-up
 ```
 
 ## Who does what
@@ -26,7 +26,7 @@ docs/            CTF_writeup.pdf
 | 2 | Authentication, audit and integration | `server/auth.py`, `server/audit.py`, `server/loader.py`, `server/data/`, README |
 | 3 | Policy core: `authorize()`, DAC, MAC, audit of decisions | `server/policy.py` |
 | 4 | RBAC, how the 3 models combine, tests | `server/policy.py`, `tests/` |
-| 5 | Client and CTF | `client/client.py`, `ctf/`, `docs/CTF_writeup.pdf` |
+| 5 | Client and CTF | `client/client.py`, `ctf/`, `CTF_writeup.pdf` |
 
 ## How to run
 
