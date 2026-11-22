@@ -69,7 +69,78 @@ python3 client/client.py --host 127.0.0.1 --port 2222 --username bob
 sftp -P 2222 bob@127.0.0.1        # OpenSSH check
 ```
 
-_(Client session output goes here once the client is finished.)_
+On Windows: `py client\client.py --host 127.0.0.1 --port 2222 --username bob`.
+
+The first time, the client shows the server's host key fingerprint and asks you to accept it
+(trust on first use). The key is saved to `client/known_hosts`. If the server ever shows a
+different key, the client refuses to connect. To skip TOFU and only trust a file you made
+yourself, pass `--known-hosts path/to/file` (OpenSSH format, e.g. `[127.0.0.1]:2222 ssh-ed25519 AAAA...`).
+
+Commands: `pwd`, `cd`, `ls [-l] [path]`, `mkdir`, `stat`, `get <rpath> [lpath]`, `put <lpath> [rpath]`,
+`help`, `quit`. Paths are relative to the current remote folder. A session as bob:
+
+```
+bob@127.0.0.1's password:
+The authenticity of host '[127.0.0.1]:2222' can't be established.
+ED25519 key fingerprint is SHA256:F4FWnHL+OKeQeXvJqMvl31XnHUgMtk0ThHmwiyx+Qnk.
+Are you sure you want to continue connecting (yes/no)? yes
+Warning: permanently added '[127.0.0.1]:2222' to client/known_hosts.
+Connected to 127.0.0.1.
+sftp> pwd
+/
+sftp> ls
+admin
+projects
+public
+sftp> mkdir demo
+sftp> stat /
+  File: /
+  Type: directory
+  Mode: drwxrwxrwx (0o777)
+  Size: 0
+Modify: 2026-11-22 19:21:33
+Access: 2026-11-22 19:21:33
+sftp> put README.md /demo/README.md
+README.md -> /demo/README.md (15 bytes)
+sftp> get /demo/README.md ./README.copy.md
+/demo/README.md -> ./README.copy.md (15 bytes)
+sftp> ls -l /demo
+-rw-rw-rw-    1 0        0              15 Nov 22 19:21 README.md
+sftp> ls /projects
+error: Permission denied (PERMISSION_DENIED)
+sftp> stat /nope
+error: No such file (NO_SUCH_FILE)
+sftp> mkdir demo
+error: File already exists (FAILURE)
+sftp> quit
+```
+
+The client builds the SFTP v3 packets itself. asyncssh is only used for the SSH connection and
+to open the `sftp` subsystem channel. It sends one request at a time and checks that every reply
+has the request id it sent.
+
+**OpenSSH interop.** Tested with OpenSSH_9.7p1 (the one that comes with Windows):
+
+```
+Connected to 127.0.0.1.
+sftp> pwd
+Remote working directory: /
+sftp> ls
+admin     projects  public
+sftp> mkdir demo
+sftp> put README.md /demo/README.md
+Uploading README.md to /demo/README.md
+sftp> get /demo/README.md copy.md
+Fetching /demo/README.md to copy.md
+sftp> ls -l /demo
+-rw-rw-rw-    1 0        0              15 Nov 22 19:47 README.md
+sftp> ls /projects
+Can't ls: "/projects" not found
+```
+
+OpenSSH `sftp` has no `stat` command, so `stat .` answers "Invalid command" from the OpenSSH client
+itself; use `ls -l` instead. OpenSSH also prints "not found" for any failed stat, also when our server
+answered PERMISSION_DENIED (the audit log shows the real reason).
 
 ## Predefined users
 
@@ -134,6 +205,34 @@ An access decision looks the same (this one is only an example of the format):
 {"timestamp": "...", "user": "eve", "op": "read", "path": "/projects/confidential/x", "allowed": false, "reason": "..."}
 ```
 
+## CTF
+
+Plant the flag before starting the server:
+
+```
+python ctf/setup_flag.py --flag "FLAG{group07_sftp_wins}"
+```
+
+It writes `/projects/confidential/flag.txt` inside the jail and a hint in `/public/ctf_hint.txt`.
+Only carol can read the flag. What stops the others:
+
+| User  | DAC (carol, analyst, 660) | MAC (confidential) | RBAC | Result |
+|-------|------|------|------|--------|
+| eve   | other, denied | public, denied | guest has only /public, denied | denied |
+| bob   | other, denied | internal, denied | admin, allowed | denied |
+| alice | group, allowed | internal, denied | analyst, allowed | denied |
+| carol | owner, allowed | confidential, allowed | analyst, allowed | allowed |
+
+Path tricks (`..`, backslashes, case variants, 8.3 names, NTFS streams, NUL bytes) are stopped
+before policy by `canonicalize()` and `safe_join()`. To try the attacks yourself:
+
+```
+python ctf/attack.py --username eve
+```
+
+It runs 24 attempts (traversal, aliasing, forged and reused handles, symlink, rename, write through a read handle)
+and prints which ones were blocked. The full story is in `CTF_writeup.pdf`.
+
 ## Known limitations
 
 - The lockout is per username and lives in memory. A restart clears it, and someone who knows a username can lock that user out for a minute.
@@ -141,6 +240,8 @@ An access decision looks the same (this one is only an example of the format):
 - Hashing takes about 35 ms and runs inside the event loop, so other connections wait briefly during a login.
 - `audit.jsonl` is never rotated, and anyone who can write to the file can change it.
 - Only password login is supported. The password is protected by the SSH connection, not by anything of ours.
+- The client sends one request at a time (no pipelining), so big transfers are slower than with OpenSSH `sftp`.
+- The client reads the password with `getpass`, so it cannot be scripted without a terminal.
 
 ## Use of generative AI
 
