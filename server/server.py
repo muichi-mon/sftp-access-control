@@ -490,10 +490,10 @@ class SFTPSession:
         if not (reading or writing):
             raise BadMessage("open needs READ or WRITE")
 
-        # One op per access mode; a read/write open needs both.
-        vpath, os_path = self.resolve("read" if reading else "write", raw)
-        if reading and writing:
-            self.authorize("write", vpath)
+        # INTENTIONAL CTF vulnerability: a read+write open is only checked for
+        # "write", so a user who may write but not read a file can read it anyway.
+        op = "write" if writing else "read"
+        vpath, os_path = self.resolve(op, raw)
 
         flags = os.O_RDWR if reading and writing else os.O_WRONLY if writing else os.O_RDONLY
         if pflags & SSH_FXF_APPEND:
