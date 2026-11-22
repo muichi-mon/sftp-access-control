@@ -3,16 +3,17 @@
 Part 4 - add policy tests (DAC, MAC, RBAC and how they combine) and
 end-to-end SFTP tests here as server.py and policy.py are filled in.
 """
+import asyncio
 import base64
 import json
 import os
+import posixpath
 import shutil
 import sys
 from pathlib import Path
 
+import asyncssh
 import pytest
-
-import posixpath
 
 SERVER_DIR = Path(__file__).resolve().parent.parent / "server"
 sys.path.insert(0, str(SERVER_DIR))
@@ -20,6 +21,8 @@ sys.path.insert(0, str(SERVER_DIR))
 import audit   # noqa: E402
 import auth    # noqa: E402
 import loader  # noqa: E402
+import policy  # noqa: E402
+import server  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +32,7 @@ def tmp_audit(tmp_path, monkeypatch):
     monkeypatch.setattr(audit, "audit_file", path)
     auth._failed.clear()
     auth._locked_until.clear()
+    policy.init(None)
     return path
 
 
@@ -48,6 +52,7 @@ def make_users(**passwords):
 # ---------- loader ----------
 
 def test_load_real_data():
+    """Real policy and user data files load cleanly with expected users and roles."""
     data = loader.load_data()
     assert set(data["users"]) == {"alice", "bob", "carol", "eve"}
     assert data["user_roles"]["eve"] == ["guest"]
@@ -55,6 +60,7 @@ def test_load_real_data():
 
 
 def test_missing_file_is_reported(tmp_path):
+    """Missing required data file raises DataError with the missing filename."""
     shutil.copytree(loader.DATA_DIR, tmp_path / "data")
     (tmp_path / "data" / "dac_owners.csv").unlink()
     with pytest.raises(loader.DataError, match="dac_owners.csv: file not found"):
@@ -62,6 +68,7 @@ def test_missing_file_is_reported(tmp_path):
 
 
 def test_unknown_role_is_reported(tmp_path):
+    """Role assigned in user_roles.json that is missing from role_perms.csv raises DataError."""
     shutil.copytree(loader.DATA_DIR, tmp_path / "data")
     roles = tmp_path / "data" / "user_roles.json"
     data = json.loads(roles.read_text(encoding="utf-8"))
@@ -74,157 +81,41 @@ def test_unknown_role_is_reported(tmp_path):
 # ---------- auth ----------
 
 def test_short_password_rejected():
+    """Passwords shorter than the minimum policy length are rejected."""
     with pytest.raises(ValueError):
         auth.make_user("x", "short")
 
 
 def test_correct_and_wrong_password(tmp_audit):
+    """Valid password succeeds, wrong password fails, and neither logs plaintext secrets."""
     users = make_users(alice="correct horse")
     assert auth.check_password(users, "alice", "correct horse")
     assert not auth.check_password(users, "alice", "wrong password")
-    lines = [json.loads(l) for l in tmp_audit.read_text().splitlines()]
-    assert [l["allowed"] for l in lines] == [True, False]
-    assert all("correct horse" not in json.dumps(l) for l in lines)
+    lines = [json.loads(line) for line in tmp_audit.read_text().splitlines()]
+    assert [line["allowed"] for line in lines] == [True, False]
+    assert all("correct horse" not in json.dumps(line) for line in lines)
 
 
 def test_unknown_user():
+    """Authentication returns False for a username not present in users."""
     users = make_users(alice="correct horse")
     assert not auth.check_password(users, "mallory", "whatever1")
 
 
 def test_lockout_after_max_fails():
+    """Repeated failed logins lock the account even when the right password is supplied."""
     users = make_users(alice="correct horse")
     for _ in range(auth.max_fails):
         assert not auth.check_password(users, "alice", "wrong password")
-    # Locked now, even the right password is refused.
     assert not auth.check_password(users, "alice", "correct horse")
+
 
 # ---------- policy helpers for Prt 4 unit tests ----------
 
 def _norm(path):
+    """Normalize a virtual SFTP path relative to '/'."""
     norm = posixpath.normpath(path if path.startswith("/") else "/" + path)
     return "/" if norm in ("", ".") else norm
-
-
-def _prefix_match(vpath, prefix):
-    pfx = _norm(prefix)
-    if pfx == "/":
-        return vpath.startswith("/")
-    return vpath == pfx or vpath.startswith(pfx + "/")
-
-
-def _best_dac_entry(vpath, dac):
-    matches = [(pfx, cfg) for pfx, cfg in dac.items() if _prefix_match(vpath, pfx)]
-    matches.sort(key=lambda item: len(_norm(item[0])), reverse=True)
-    return matches[0][1] if matches else None
-
-# temporary
-def _dac_check(user, op, path, data):
-    """Owner/group/mode evaluation for DAC tests."""
-    vpath = _norm(path)
-    entry = _best_dac_entry(vpath, data["dac"])
-    if not entry:
-        return False, "DAC: no matching entry"
-    is_dir_op = op in ("list", "mkdir", "rmdir")
-    mode = entry["dir_mode"] if is_dir_op else entry["file_mode"]
-
-    if user == entry["owner"]:
-        rwx = (mode >> 6) & 0o7
-    elif user in data.get("groups", {}).get(entry["group"], []):
-        rwx = (mode >> 3) & 0o7
-    else:
-        rwx = mode & 0o7
-
-    if op in ("realpath", "stat", "read"):
-        needed = 0o4
-    elif op in ("write", "mkdir"):
-        needed = 0o2
-    elif op in ("remove", "rmdir"):
-        needed = 0o6
-    elif op == "list":
-        needed = 0o5
-    else:
-        return False, f"DAC: unknown op {op}"
-
-    return ((rwx & needed) == needed), f"DAC: mode={oct(mode)} rwx={oct(rwx)} needed={oct(needed)}"
-
-#temporary
-def _mac_check(user, op, path, data):
-    """Bell-LaPadula style no-read-up / no-write-down evaluation for MAC tests."""
-    levels = data["mac"]["levels"]
-    user_lvl_name = data["mac"]["users"].get(user)
-    if user_lvl_name not in levels:
-        return False, "MAC: unknown user clearance"
-
-    vpath = _norm(path)
-    matches = [(pfx, lbl) for pfx, lbl in data["mac"]["labels"].items() if _prefix_match(vpath, pfx)]
-    matches.sort(key=lambda item: len(_norm(item[0])), reverse=True)
-    if not matches:
-        return False, "MAC: no resource label"
-
-    res_lvl_name = matches[0][1]
-    u_idx = levels.index(user_lvl_name)
-    r_idx = levels.index(res_lvl_name)
-
-    if op in ("realpath", "stat", "list", "read"):
-        allowed = u_idx >= r_idx
-        return allowed, "MAC: allowed" if allowed else "MAC: no read up"
-    if op in ("write", "mkdir", "remove", "rmdir"):
-        allowed = u_idx <= r_idx
-        return allowed, "MAC: allowed" if allowed else "MAC: no write down"
-    return False, "MAC: unsupported op"
-
-
-def _rbac_check(user, op, path, data):
-    """Role union + optional per-user deny override for RBAC tests."""
-    op_map = {
-        "realpath": "read",
-        "stat": "read",
-        "list": "read",
-        "mkdir": "write",
-        "write": "write",
-        "remove": "delete",
-        "rmdir": "delete",
-    }
-    action = op_map.get(op)
-    if not action:
-        return False, "RBAC: unsupported op"
-
-    vpath = _norm(path)
-    overrides = (data.get("user_overrides") or {}).get(user, {})
-    for rule in overrides.get("deny", []):
-        if rule.get("action") == action and _prefix_match(vpath, rule.get("prefix", "/")):
-            return False, "RBAC: explicit deny override"
-
-    allowed_actions = set()
-    for role in data.get("user_roles", {}).get(user, []):
-        perms = data.get("role_perms", {}).get(role, {})
-        matching = [(pfx, acts) for pfx, acts in perms.items() if _prefix_match(vpath, pfx)]
-        matching.sort(key=lambda item: len(_norm(item[0])), reverse=True)
-        if matching:
-            allowed_actions |= set(matching[0][1])
-
-    if action in allowed_actions:
-        return True, "RBAC: allowed"
-    return False, "RBAC: permission missing"
-
-# temporary
-def _combine_and_audit(user, op, path, data):
-    """Conjunctive DAC ∧ MAC ∧ RBAC gate with mandatory audit logging."""
-    vpath = _norm(path)
-    dac_ok, dac_reason = _dac_check(user, op, vpath, data)
-    mac_ok, mac_reason = _mac_check(user, op, vpath, data)
-    rbac_ok, rbac_reason = _rbac_check(user, op, vpath, data)
-
-    allowed = dac_ok and mac_ok and rbac_ok
-    if allowed:
-        reason = "allowed by DAC, MAC, and RBAC"
-    else:
-        reasons = [r for ok, r in ((dac_ok, dac_reason), (mac_ok, mac_reason), (rbac_ok, rbac_reason)) if not ok]
-        reason = "; ".join(reasons)
-
-    audit.log(user, op, vpath, allowed, reason)
-    return allowed, reason
 
 
 @pytest.fixture
@@ -278,55 +169,65 @@ def policy_fixture_data():
 # ---------- policy / SFTP (Part 4) ----------
 
 def test_eve_cannot_read_confidential(policy_fixture_data, tmp_audit):
-    """Guest user eve with public clearance cannot read /projects/confidential/flag.txt."""
-    allowed, reason = _combine_and_audit("eve", "read", "/projects/confidential/flag.txt", policy_fixture_data)
+    """Guest user eve with public clearance is denied reading /projects/confidential/flag.txt and audited."""
+    policy.init(policy_fixture_data)
+    allowed, _reason = policy.authorize("eve", "read", "/projects/confidential/flag.txt")
     assert allowed is False
-    assert "MAC" in reason or "RBAC" in reason
     records = [json.loads(line) for line in tmp_audit.read_text().splitlines()]
-    assert len(records) == 1 and records[0]["allowed"] is False
+    assert len(records) == 1
+    assert records[0]["user"] == "eve"
+    assert records[0]["op"] == "read"
+    assert records[0]["path"] == "/projects/confidential/flag.txt"
+    assert records[0]["allowed"] is False
 
 
 def test_dac_owner_read_write_and_other_denied(policy_fixture_data):
-    """Owner alice can read/write under /projects while guest eve without write mode is denied."""
-    assert _dac_check("alice", "read", "/projects/note.txt", policy_fixture_data)[0] is True
-    assert _dac_check("alice", "write", "/projects/note.txt", policy_fixture_data)[0] is True
-    assert _dac_check("eve", "write", "/projects/note.txt", policy_fixture_data)[0] is False
+    """Owner alice can read/write under /projects while eve without write permission is denied."""
+    policy.init(policy_fixture_data)
+    assert policy.check_dac("alice", "read", "/projects/note.txt")[0] is True
+    assert policy.check_dac("alice", "write", "/projects/note.txt")[0] is True
+    assert policy.check_dac("eve", "write", "/projects/note.txt")[0] is False
 
 
 def test_dac_directory_execute_controls_listing(policy_fixture_data):
-    """Directory mode bits determine whether listing (/public) is allowed or denied."""
-    assert _dac_check("eve", "list", "/public", policy_fixture_data)[0] is True
+    """Directory execute/read bits determine whether listing (/public) is allowed or denied."""
+    policy.init(policy_fixture_data)
+    assert policy.check_dac("eve", "list", "/public")[0] is True
     policy_fixture_data["dac"]["/public"]["dir_mode"] = 0o644
-    assert _dac_check("eve", "list", "/public", policy_fixture_data)[0] is False
+    assert policy.check_dac("eve", "list", "/public")[0] is False
 
 
 def test_mac_no_read_up_and_no_write_down(policy_fixture_data):
     """Internal user cannot read confidential data, and confidential user cannot write down to public."""
-    assert _mac_check("alice", "read", "/public/readme.txt", policy_fixture_data)[0] is True
-    assert _mac_check("alice", "read", "/projects/internal.txt", policy_fixture_data)[0] is True
-    assert _mac_check("alice", "read", "/projects/confidential/secret.txt", policy_fixture_data)[0] is False
-    assert _mac_check("carol", "write", "/public/leak.txt", policy_fixture_data)[0] is False
+    policy.init(policy_fixture_data)
+    assert policy.check_mac("alice", "read", "/public/readme.txt")[0] is True
+    assert policy.check_mac("alice", "read", "/projects/internal.txt")[0] is True
+    assert policy.check_mac("alice", "read", "/projects/confidential/secret.txt")[0] is False
+    assert policy.check_mac("carol", "write", "/public/leak.txt")[0] is False
 
 
 def test_rbac_analyst_scope_role_union_and_deny_override(policy_fixture_data):
-    """Analyst can write /projects but not mkdir /admin; adding admin role enables it; deny overrides allow."""
-    assert _rbac_check("alice", "write", "/projects/plan.txt", policy_fixture_data)[0] is True
-    assert _rbac_check("alice", "mkdir", "/admin/sub", policy_fixture_data)[0] is False
-    assert _rbac_check("dual", "mkdir", "/admin/sub", policy_fixture_data)[0] is True
+    """Analyst can write /projects but not mkdir /admin; union with admin enables it; deny overrides allow."""
+    policy.init(policy_fixture_data)
+    assert policy.check_rbac("alice", "write", "/projects/plan.txt")[0] is True
+    assert policy.check_rbac("alice", "mkdir", "/admin/sub")[0] is False
+    assert policy.check_rbac("dual", "mkdir", "/admin/sub")[0] is True
 
     policy_fixture_data["user_overrides"]["dual"] = {
         "deny": [{"action": "write", "prefix": "/admin"}]
     }
-    assert _rbac_check("dual", "write", "/admin/sub", policy_fixture_data)[0] is False
+    assert policy.check_rbac("dual", "write", "/admin/sub")[0] is False
 
 
 def test_composite_dac_mac_rbac_and_traversal_denied(policy_fixture_data, tmp_audit):
-    """Composite rule denies when any single model denies, and path traversal is rejected and audited."""
-    # Carol has confidential clearance (MAC ok) and analyst role on /projects (RBAC ok),
-    # but DAC owner on /projects/plan.txt is alice with 0o660 (other/carol write denied by DAC).
+    """Composite policy denies when any single model denies, and traversal attempts are rejected and audited."""
+    # Give carol RBAC permission on /projects as well to isolate DAC/MAC denial from RBAC.
+    policy_fixture_data["role_perms"]["analyst"]["/projects"].add("delete")
     policy_fixture_data["dac"]["/projects"]["owner"] = "alice"
     policy_fixture_data["dac"]["/projects"]["group"] = "alice_only"
-    allowed, _ = _combine_and_audit("carol", "write", "/projects/plan.txt", policy_fixture_data)
+    policy.init(policy_fixture_data)
+
+    allowed, _ = policy.authorize("carol", "write", "/projects/plan.txt")
     assert allowed is False
 
     # Traversal outside the jail is refused before filesystem access and logged.
@@ -340,15 +241,8 @@ def test_composite_dac_mac_rbac_and_traversal_denied(policy_fixture_data, tmp_au
         assert {"timestamp", "user", "op", "path", "allowed", "reason"}.issubset(rec.keys())
         assert rec["allowed"] is False
 
+
 # ---------- server: paths and jail ----------
-
-import asyncio    # noqa: E402
-
-import asyncssh   # noqa: E402
-
-import policy     # noqa: E402
-import server     # noqa: E402
-
 
 @pytest.mark.parametrize("raw, expected", [
     ("", "/"), (".", "/"), ("/", "/"), ("demo", "/demo"), ("/a//b/./c/", "/a/b/c"),
@@ -437,3 +331,32 @@ def test_sftp_end_to_end(tmp_path, monkeypatch, tmp_audit):
     traversal = [r for r in records if r["path"] == "/../../etc/passwd"]
     assert traversal and traversal[0]["allowed"] is False
     assert traversal[0]["user"] == "bob" and traversal[0]["reason"] == "path escapes the jail"
+
+
+def test_sftp_end_to_end_real_policy(tmp_path, tmp_audit):
+    """End-to-end SFTP enforces policy.authorize() for allowed and denied operations and audits both."""
+    data = loader.load_data()
+    data["users"] = make_users(eve="eve-pass-1")
+    key = tmp_path / "hostkey"
+    asyncssh.generate_private_key("ssh-ed25519").write_private_key(str(key))
+
+    async def scenario():
+        srv = await server.start_server(data, "127.0.0.1", 0, host_key=key, jail_dir=tmp_path / "jail")
+        (tmp_path / "jail" / "public" / "hello.txt").write_text("hello")
+        (tmp_path / "jail" / "projects" / "confidential" / "flag.txt").write_text("FLAG{secret}")
+        try:
+            async with asyncssh.connect("127.0.0.1", srv.get_port(), username="eve",
+                                        password="eve-pass-1", known_hosts=None) as conn:
+                async with conn.start_sftp_client() as sftp:
+                    async with sftp.open("/public/hello.txt", "rb") as f:
+                        assert await f.read() == b"hello"
+                    with pytest.raises(asyncssh.SFTPPermissionDenied):
+                        await sftp.stat("/projects/confidential/flag.txt")
+        finally:
+            srv.close()
+
+    asyncio.run(scenario())
+
+    records = [json.loads(line) for line in tmp_audit.read_text().splitlines()]
+    assert any(r["user"] == "eve" and r["path"] == "/public/hello.txt" and r["allowed"] is True for r in records)
+    assert any(r["user"] == "eve" and r["path"] == "/projects/confidential/flag.txt" and r["allowed"] is False for r in records)
