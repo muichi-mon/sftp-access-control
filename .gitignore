@@ -6,6 +6,7 @@ server/ssh_host_ed25519_key
 server/ssh_host_ed25519_key.pub
 
 # Runtime output
+client/known_hosts
 server/audit.jsonl
 server/sftp_root/*
 !server/sftp_root/.gitkeep
