@@ -162,8 +162,8 @@ def test_only_carol_reads_the_flag(env, user, can_read, tmp_audit):
         assert hit and hit[0]["user"] == user and hit[0]["allowed"] is False
 
 
-def test_read_write_open_is_the_only_way_in(env, tmp_audit):
-    """alice reads the flag via a read+write open (the intended bug) but is denied a read-only open; eve and bob get neither."""
+def test_read_write_open_cannot_read_the_flag(env, tmp_audit):
+    """A read+write open needs read too: alice may write the flag (MAC write-up) but cannot read it that way."""
     async def attempt(port, user, coro_name):
         conn, sftp = await login(env, port, user)
         try:
@@ -173,29 +173,29 @@ def test_read_write_open_is_the_only_way_in(env, tmp_audit):
         finally:
             conn.close()
 
-    # alice: read+write open leaks the flag, read-only open is refused.
-    assert run(env, lambda p: attempt(p, "alice", "read_through_write")) == FLAG
-    denied = run(env, lambda p: attempt(p, "alice", "try_read"))
-    assert isinstance(denied, client.SFTPError) and denied.code == 3
+    # alice may open the flag write-only, but every open that includes READ is refused.
+    assert run(env, lambda p: attempt(p, "alice", "open_for_write")) == "opened for writing"
+    for user in ("alice", "eve", "bob"):
+        for coro_name in ("read_through_write", "try_read"):
+            result = run(env, lambda p, u=user, c=coro_name: attempt(p, u, c))
+            assert isinstance(result, client.SFTPError) and result.code == 3
 
-    # eve and bob cannot even pass the write check, so the exploit does nothing.
-    for user in ("eve", "bob"):
-        result = run(env, lambda p, u=user: attempt(p, u, "read_through_write"))
-        assert isinstance(result, client.SFTPError) and result.code == 3
+    # carol, who may read and write it, can still open it read+write.
+    assert run(env, lambda p: attempt(p, "carol", "read_through_write")) == FLAG
 
-    # alice's write-open on the flag is in the audit log.
+    # alice's read+write attempt is audited as a denied read.
     records = [json.loads(l) for l in tmp_audit.read_text().splitlines()]
-    assert any(r["user"] == "alice" and r["op"] == "write" and r["path"] == attack.FLAG
-               and r["allowed"] is True for r in records)
+    assert any(r["user"] == "alice" and r["op"] == "read" and r["path"] == attack.FLAG
+               and r["allowed"] is False for r in records)
     assert (env["jail"] / "projects" / "confidential" / "flag.txt").read_text().strip() == FLAG
 
 
 def test_attack_script_outcomes(env, capsys):
-    """ctf/attack.py captures the flag for alice (intended) but never for eve or bob."""
+    """ctf/attack.py never captures the flag for eve, alice or bob; only carol, who is allowed, reads it."""
     async def scenario(port):
         env["store"].write_text("")
         results = {}
-        for user in ("eve", "alice", "bob"):
+        for user in ("eve", "alice", "bob", "carol"):
             conn, _ = await login(env, port, user)
             conn.close()
             args = type("A", (), {"host": "127.0.0.1", "port": port, "username": user,
@@ -203,5 +203,5 @@ def test_attack_script_outcomes(env, capsys):
             results[user] = await attack.run(args, password(user))
         return results
 
-    assert run(env, scenario) == {"eve": False, "alice": True, "bob": False}
+    assert run(env, scenario) == {"eve": False, "alice": False, "bob": False, "carol": True}
     assert (env["jail"] / "projects" / "confidential" / "flag.txt").read_text().strip() == FLAG

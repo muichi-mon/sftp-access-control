@@ -1,27 +1,3 @@
-"""SSH transport + SFTP v3 handling.
-
-Part 1 - Server protocol and hardening.
-
-asyncssh gives us the SSH layer (key exchange, encryption, channels, the password
-exchange). Everything inside the "sftp" subsystem is our own code: packet framing,
-request IDs, the handle table and the replies.
-
-Every request that names a path goes through the same steps, in this order:
-
-    1. canonicalize()      SFTP path -> clean POSIX path rooted at "/" (the jail)
-    2. safe_join()         POSIX path -> OS path inside sftp_root, refusing anything
-                           that resolves somewhere else (symlinks, case tricks, ...)
-    3. policy.authorize()  DAC + MAC + RBAC decision, audited by policy.py
-    4. the filesystem call
-
-Contract with policy.py (Parts 3 and 4):
-    policy.init(data)                  optional, called once at startup with the
-                                       dict returned by loader.load_data()
-    policy.authorize(user, op, path)   -> (allowed: bool, reason: str)
-        path is the canonical SFTP path, e.g. "/projects/confidential/flag.txt"
-        op is one of OPS below.
-If authorize() is missing or raises, the request is denied (default deny).
-"""
 import argparse
 import asyncio
 import errno
@@ -490,10 +466,11 @@ class SFTPSession:
         if not (reading or writing):
             raise BadMessage("open needs READ or WRITE")
 
-        # INTENTIONAL CTF vulnerability: a read+write open is only checked for
-        # "write", so a user who may write but not read a file can read it anyway.
-        op = "write" if writing else "read"
-        vpath, os_path = self.resolve(op, raw)
+        # Every access mode asked for is authorized: a read+write open needs both
+        # "read" and "write", so write access can never be used to read a file.
+        vpath, os_path = self.resolve("read" if reading else "write", raw)
+        if reading and writing:
+            self.authorize("write", vpath)
 
         flags = os.O_RDWR if reading and writing else os.O_WRONLY if writing else os.O_RDONLY
         if pflags & SSH_FXF_APPEND:

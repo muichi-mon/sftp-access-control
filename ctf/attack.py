@@ -43,7 +43,8 @@ async def open_for_write(sftp, path):
 
 
 async def read_through_write(sftp, path):
-    # the exploit: open read+write (write is allowed), then read through the handle
+    # open read+write and read through the handle: a user who may write but not
+    # read the file (alice) tries to use her write access to read it
     handle = await sftp.open(path, client.SSH_FXF_READ | client.SSH_FXF_WRITE)
     try:
         return (await sftp.read(handle, 0, 4096)).decode("utf-8", "replace").strip()
@@ -58,7 +59,7 @@ async def attempts(sftp, second):
     yield "stat the flag", sftp.stat(FLAG)
     yield "list the folder", sftp.listdir("/projects/confidential")
     yield "open the flag for writing", open_for_write(sftp, FLAG)
-    yield "read+write open, then read (exploit)", read_through_write(sftp, FLAG)
+    yield "read+write open, then read", read_through_write(sftp, FLAG)
     yield "mkdir inside the folder", sftp.mkdir("/projects/confidential/x")
     yield "symlink to the flag", sftp.request(SSH_FXP_SYMLINK, sstr("/public/link") + sstr(FLAG))
     yield "rename the flag out", sftp.request(SSH_FXP_RENAME, sstr(FLAG) + sstr("/public/flag.txt"))

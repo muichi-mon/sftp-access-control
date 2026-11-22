@@ -190,11 +190,15 @@ def test_dac_owner_read_write_and_other_denied(policy_fixture_data):
 
 
 def test_dac_directory_execute_controls_listing(policy_fixture_data):
-    """Directory execute/read bits determine whether listing (/public) is allowed or denied."""
+    """Directory x bit controls ls (list) but, by design, not stat, which needs only r."""
     policy.init(policy_fixture_data)
     assert policy.check_dac("eve", "list", "/public")[0] is True
-    policy_fixture_data["dac"]["/public"]["dir_mode"] = 0o644
+    assert policy.check_dac("eve", "stat", "/public")[0] is True
+    policy_fixture_data["dac"]["/public"]["dir_mode"] = 0o644   # other: r--, no x
     assert policy.check_dac("eve", "list", "/public")[0] is False
+    assert policy.check_dac("eve", "stat", "/public")[0] is True
+    policy_fixture_data["dac"]["/public"]["dir_mode"] = 0o640   # other: ---, no r
+    assert policy.check_dac("eve", "stat", "/public")[0] is False
 
 
 def test_mac_no_read_up_and_no_write_down(policy_fixture_data):
@@ -209,6 +213,7 @@ def test_mac_no_read_up_and_no_write_down(policy_fixture_data):
 def test_rbac_analyst_scope_role_union_and_deny_override(policy_fixture_data):
     """Analyst can write /projects but not mkdir /admin; union with admin enables it; deny overrides allow."""
     policy.init(policy_fixture_data)
+    assert policy.check_rbac("alice", "read", "/projects/plan.txt")[0] is True
     assert policy.check_rbac("alice", "write", "/projects/plan.txt")[0] is True
     assert policy.check_rbac("alice", "mkdir", "/admin/sub")[0] is False
     assert policy.check_rbac("dual", "mkdir", "/admin/sub")[0] is True
@@ -219,27 +224,56 @@ def test_rbac_analyst_scope_role_union_and_deny_override(policy_fixture_data):
     assert policy.check_rbac("dual", "write", "/admin/sub")[0] is False
 
 
-def test_composite_dac_mac_rbac_and_traversal_denied(policy_fixture_data, tmp_audit):
-    """Composite policy denies when any single model denies, and traversal attempts are rejected and audited."""
-    # Give carol RBAC permission on /projects as well to isolate DAC/MAC denial from RBAC.
-    policy_fixture_data["role_perms"]["analyst"]["/projects"].add("delete")
-    policy_fixture_data["dac"]["/projects"]["owner"] = "alice"
-    policy_fixture_data["dac"]["/projects"]["group"] = "alice_only"
+def test_composite_dac_allows_mac_denies(policy_fixture_data):
+    """DAC and RBAC allow alice to read the confidential file but MAC denies, so the final decision is deny."""
     policy.init(policy_fixture_data)
-
-    allowed, _ = policy.authorize("carol", "write", "/projects/plan.txt")
+    path = "/projects/confidential/flag.txt"
+    assert policy.check_dac("alice", "read", path)[0] is True     # group analyst, 660
+    assert policy.check_rbac("alice", "read", path)[0] is True    # analyst on /projects
+    assert policy.check_mac("alice", "read", path)[0] is False    # internal < confidential
+    allowed, reason = policy.authorize("alice", "read", path)
     assert allowed is False
+    assert "MAC" in reason and "DAC" not in reason and "RBAC" not in reason
 
-    # Traversal outside the jail is refused before filesystem access and logged.
-    with pytest.raises(server.PathError):
-        server.canonicalize("/../../etc/passwd")
-    audit.log("carol", "read", "/../../etc/passwd", False, "path escapes the jail")
 
+def test_composite_mac_allows_dac_denies(policy_fixture_data):
+    """MAC and RBAC allow bob to read /projects but DAC denies (he is "other"), so the final decision is deny."""
+    policy.init(policy_fixture_data)
+    path = "/projects/plan.txt"
+    assert policy.check_mac("bob", "read", path)[0] is True       # internal = internal
+    assert policy.check_rbac("bob", "read", path)[0] is True      # admin on /
+    assert policy.check_dac("bob", "read", path)[0] is False      # other on 660
+    allowed, reason = policy.authorize("bob", "read", path)
+    assert allowed is False
+    assert "DAC" in reason and "MAC" not in reason and "RBAC" not in reason
+
+
+def test_composite_all_allow(policy_fixture_data, tmp_audit):
+    """Only when DAC, MAC and RBAC all allow is the request allowed, and the allow is audited with every field."""
+    policy.init(policy_fixture_data)
+    allowed, _ = policy.authorize("alice", "read", "/projects/plan.txt")
+    assert allowed is True
     records = [json.loads(line) for line in tmp_audit.read_text().splitlines()]
-    assert len(records) == 2
-    for rec in records:
-        assert {"timestamp", "user", "op", "path", "allowed", "reason"}.issubset(rec.keys())
-        assert rec["allowed"] is False
+    assert len(records) == 1
+    assert set(records[0]) == {"timestamp", "user", "op", "path", "allowed", "reason"}
+    assert records[0]["user"] == "alice" and records[0]["allowed"] is True
+
+
+def test_traversal_denied_before_policy_and_audited(policy_fixture_data, tmp_path, tmp_audit):
+    """A traversal attempt is refused by the server's resolve step, never reaches policy, and is audited as denied."""
+    policy.init(policy_fixture_data)
+    jail = tmp_path / "jail"
+    jail.mkdir()
+    session = server.SFTPSession(channel=None, user="bob", jail_real=os.path.realpath(jail))
+    with pytest.raises(server.PathError):
+        session.resolve("read", "/../../etc/passwd")
+    records = [json.loads(line) for line in tmp_audit.read_text().splitlines()]
+    assert len(records) == 1   # only the server's record: policy was never asked
+    rec = records[0]
+    assert set(rec) == {"timestamp", "user", "op", "path", "allowed", "reason"}
+    assert rec["user"] == "bob" and rec["op"] == "read"
+    assert rec["path"] == "/../../etc/passwd"
+    assert rec["allowed"] is False and rec["reason"] == "path escapes the jail"
 
 
 # ---------- server: paths and jail ----------

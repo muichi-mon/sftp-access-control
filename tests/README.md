@@ -6,3 +6,4 @@ Run the test suite from the repository root:
 pytest
 # or, if `pytest` is not on your PATH:
 python -m pytest -v
+```

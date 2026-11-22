@@ -13,8 +13,8 @@ server/
   data/          the static users, roles, labels and owners
   sftp_root/     the jail (created at runtime; initially empty)
 client/client.py SFTP client
-tests/test_sftp.py  pytest tests
-ctf/             flag setup
+tests/           pytest tests (test_sftp.py, test_client.py)
+ctf/             setup_flag.py (plants the flag), attack.py (attack script)
 CTF_writeup.pdf  CTF write-up
 ```
 
@@ -98,14 +98,14 @@ sftp> stat /
   Type: directory
   Mode: drwxrwxrwx (0o777)
   Size: 0
-Modify: 2026-11-22 19:21:33
-Access: 2026-11-22 19:21:33
+Modify: 2026-11-22 21:01:27
+Access: 2026-11-22 21:01:27
 sftp> put README.md /demo/README.md
-README.md -> /demo/README.md (15 bytes)
+README.md -> /demo/README.md (20856 bytes)
 sftp> get /demo/README.md ./README.copy.md
-/demo/README.md -> ./README.copy.md (15 bytes)
+/demo/README.md -> ./README.copy.md (20856 bytes)
 sftp> ls -l /demo
--rw-rw-rw-    1 0        0              15 Nov 22 19:21 README.md
+-rw-rw-rw-    1 0        0           20856 Nov 22 21:01 README.md
 sftp> ls /projects
 error: Permission denied (PERMISSION_DENIED)
 sftp> stat /nope
@@ -115,11 +115,15 @@ error: File already exists (FAILURE)
 sftp> quit
 ```
 
+`stat` and `ls -l` show the real mode bits of the file on disk (on Windows always `rw` for everyone).
+They are not the DAC modes from `dac_owners.csv`; those are what the server enforces.
+
 The client builds the SFTP v3 packets itself. asyncssh is only used for the SSH connection and
 to open the `sftp` subsystem channel. It sends one request at a time and checks that every reply
 has the request id it sent.
 
-**OpenSSH interop.** Tested with OpenSSH_9.7p1 (the one that comes with Windows):
+**OpenSSH interop.** Tested with OpenSSH_9.7p1 (the one that comes with Windows). This output is
+from an earlier, separate run with a smaller `README.md`, so the file size differs from the session above:
 
 ```
 Connected to 127.0.0.1.
@@ -151,9 +155,9 @@ this README. `users.json` only stores salted hashes.
 | User  | Role    | Clearance    | Intended powers and limits |
 |-------|---------|--------------|----------------------------|
 | alice | analyst | internal     | Reads and writes in `/projects` (she owns it). Reads `/public`. Cannot read `/projects/confidential` (MAC: no read up). Cannot touch `/admin` (RBAC). |
-| bob   | admin   | internal     | RBAC lets him do everything, and he owns `/`, `/public` and `/admin`. But he is not in the `analyst` group, so DAC keeps him out of `/projects`, and MAC keeps him away from anything confidential. |
+| bob   | admin   | internal     | RBAC lets him do everything, and he owns `/`, `/public` and `/admin`. But he is not in the `analyst` group, so DAC keeps him out of `/projects`, MAC keeps him away from anything confidential, and MAC (no write down) means he can read `/public` but not write to it. |
 | carol | analyst | confidential | Owns `/projects/confidential` and can read everything in `/projects`. MAC (no write down) stops her from writing into `/projects` or `/public`. |
-| eve   | guest   | public       | Can only read `/public`. Everything else is denied. She is the attacker in the CTF. |
+| eve   | guest   | public       | Can only read `/public` (so she starts with `cd /public`; `ls /` is denied because the root is labelled internal and the guest role only covers `/public`). Everything else is denied. She is the attacker in the CTF. |
 
 To add or change a user, run `python server/auth.py <username>`. It asks for a password
 (at least 8 characters) and prints the JSON entry to paste into `users.json`.
@@ -175,8 +179,191 @@ that prefixes start with `/`, and that modes and `y` cells are valid.
 
 ## Access Control Design
 
-_To be written by whoever does Part 4: how DAC, MAC and RBAC are applied, the composition
-rule and the 2x2 table. The data files above are the input to that section._
+All access control goes through one function, `policy.authorize(user, op, path)`, which returns
+`(allowed, reason)` and writes one audit line per decision. The rules come from the data files in
+`server/data/` and are fixed while the server runs.
+
+### Operations covered
+
+| SFTP request | AuthZ operation | Notes |
+|--------------|-----------------|-------|
+| `REALPATH` | `realpath` | Always allowed for a logged-in user: it only cleans up the path and touches no file. Still audited. |
+| `STAT`, `LSTAT` | `stat` | |
+| `OPENDIR` | `list` | `READDIR` then reads from the handle. |
+| `MKDIR` | `mkdir` | The mode sent by the client is ignored. |
+| `OPEN` with only `READ` | `read` | |
+| `OPEN` with `WRITE`, `APPEND`, `CREAT` or `TRUNC` | `write` | |
+| `OPEN` with `READ` and a write flag | `read` **and** `write` | Both must be allowed, so write access can never be used to read a file. |
+| `REMOVE` | `remove` | |
+| `RMDIR` | `rmdir` | |
+| `READ`, `WRITE`, `FSTAT`, `CLOSE` | none | They work on a handle that was authorized at `OPEN`/`OPENDIR`. Handles belong to one session, and a handle remembers whether it was opened for reading or writing. |
+| `SETSTAT`, `RENAME`, `SYMLINK`, `READLINK`, anything else | none | Answered with `OP_UNSUPPORTED`. |
+
+**Default deny.** A request is refused when:
+- the operation is not in the table above,
+- no rule matches the path in one of the three models,
+- the user has no clearance or no roles,
+- the policy data is not loaded, or
+- `authorize()` raises an error.
+
+### Enforcement point
+
+Every request that names a path goes through the same steps in [server/server.py](server/server.py):
+
+1. `canonicalize()` turns the client path into a clean POSIX path rooted at `/` (the jail).
+   It refuses `..` above the root, backslashes, colons, control characters and NUL bytes.
+2. `safe_join()` maps that path to the OS path inside `server/sftp_root/`. It refuses the path
+   if `realpath()` gives back anything else, which blocks symlinks and, on Windows, case
+   variants, 8.3 short names and device names.
+3. `policy.authorize()` decides, using the canonical path from step 1.
+4. Only then is the filesystem called.
+
+A request stopped at step 1 or 2 never reaches the policy. The server audits it itself, with the
+raw path and the reason (for example `path escapes the jail`).
+
+### DAC (owner / group / other)
+
+- **Ownership.** [dac_owners.csv](server/data/dac_owners.csv) gives each path prefix an owner,
+  a group, a `dir_mode` and a `file_mode`, in octal like Unix. A path uses the entry with the
+  **longest matching prefix**. A path with no matching entry is denied.
+- **Groups.** A user is in a group when they have a role with the same name. For example, alice
+  and carol have the `analyst` role, so they are in the `analyst` group.
+- **Which bits apply.** If the user is the owner, the owner bits apply. Otherwise, if the user is
+  in the group, the group bits apply. Otherwise the "other" bits apply.
+- **Bits needed for each operation:**
+
+  | Operation | Mode used | Bits needed |
+  |-----------|-----------|-------------|
+  | `read` | `file_mode` | r |
+  | `write` | `file_mode` | w |
+  | `stat` | `file_mode` (`dir_mode` when the path is itself a prefix in the CSV) | r |
+  | `list` | `dir_mode` | r and x |
+  | `mkdir`, `rmdir`, `remove` | `dir_mode` | w and x (they change the folder, as on Unix) |
+
+  So on a folder, x is what allows listing it. Without x, `ls` is denied even if r is set.
+  `stat` only needs r, so by design the x bit does **not** affect `stat`: with `dir_mode 744`,
+  "other" can `stat` the folder but not `ls` it. The x bit of parent folders is not checked
+  (no Unix-style path traversal check); each path is judged by its own closest DAC entry.
+- **Inheritance.** New files and folders do not get their own entry. They inherit the owner,
+  group and modes of the closest prefix above them. For example, a file that alice uploads to
+  `/projects/demo/` follows the `/projects` entry. The mode a client sends with `MKDIR` or
+  `OPEN` is ignored.
+
+Examples with `/projects` (owner alice, group analyst, `dir 770`, `file 660`):
+
+| User | Class | `read /projects/a.txt` | `write /projects/a.txt` | `list /projects` |
+|------|-------|------------------------|-------------------------|------------------|
+| alice | owner | allowed (rw-) | allowed | allowed (rwx) |
+| carol | group (analyst) | allowed (rw-) | allowed | allowed (rwx) |
+| bob | other | denied (---) | denied | denied |
+
+On `/public` (`dir 755`, `file 644`), eve is "other": she can list the folder (r-x) and read
+files (r--), but not write them.
+
+### MAC (Bell-LaPadula)
+
+- **Labels, lowest first:** `public` < `internal` < `confidential`.
+- **Storage.** [mac_labels.json](server/data/mac_labels.json) holds the `levels`, the path labels
+  (`labels`, longest prefix wins, so `/projects/confidential` overrides `/projects`) and each
+  user's clearance (`users`).
+
+  | Prefix | Label |
+  |--------|-------|
+  | `/` | internal |
+  | `/public` | public |
+  | `/projects` | internal |
+  | `/projects/confidential` | confidential |
+  | `/admin` | internal |
+
+  | User | Clearance |
+  |------|-----------|
+  | alice | internal |
+  | bob | internal |
+  | carol | confidential |
+  | eve | public |
+
+- **Reading** (`read`, `stat`, `list`) needs clearance ≥ label: **no read up**.
+- **Writing** (`write`, `mkdir`, `rmdir`, `remove`) needs clearance ≤ label: **no write down**.
+- A user without a clearance, or a path without a label, is denied.
+
+Examples:
+- alice (internal) can read `/public` and `/projects`, but not `/projects/confidential` (read up).
+- carol (confidential) can read everything, but cannot write into `/projects` or `/public` (write down).
+- eve (public) cannot `ls /`, because the root is labelled internal.
+
+### RBAC (roles)
+
+- [user_roles.json](server/data/user_roles.json) gives each user a list of roles.
+- [role_perms.csv](server/data/role_perms.csv) gives each role actions on path prefixes.
+  A `y` grants the action.
+- **Actions.** Each operation needs one action:
+  - `read`: `read`, `stat`, `list`
+  - `write`: `write`, `mkdir`
+  - `delete`: `remove`, `rmdir`
+
+  `realpath` needs no action: `authorize()` allows it before the models are checked (see
+  [Operations covered](#operations-covered)).
+
+| Role | Prefix | read | write | delete |
+|------|--------|------|-------|--------|
+| admin | `/` | y | y | y |
+| analyst | `/projects` | y | y | |
+| analyst | `/public` | y | | |
+| guest | `/public` | y | | |
+
+- **Scoping.** Inside one role, only the most specific (longest) matching prefix counts. So an
+  analyst gets only `read` under `/public`, and nothing at all under `/admin`.
+- **Several roles.** A user's permissions are the **union** of their roles' permissions. Giving
+  alice the `admin` role as well would let her `mkdir` under `/admin` (as far as RBAC is concerned).
+- **Per-user overrides.** `check_rbac()` also supports per-user `allow` and `deny` rules. A
+  `deny` is checked first and **always overrides** any allow. The shipped data files do not
+  define any overrides, so this is only used in the tests.
+
+### Composition rule
+
+```
+allowed = DAC allows  AND  MAC allows  AND  RBAC allows
+```
+
+All three models are always evaluated. If any of them denies, the request is denied, and the
+audit reason lists every model that said no. There is no other conflict rule: a deny from one
+model cannot be outvoted by the others.
+
+Example outcomes with the real data. RBAC allows all four requests below, so DAC and MAC
+alone decide:
+
+|  | **MAC allows** | **MAC denies** |
+|--|----------------|----------------|
+| **DAC allows** | alice reads `/projects/plan.txt` → **allowed** | alice reads `/projects/confidential/flag.txt` → **denied** (no read up) |
+| **DAC denies** | bob reads `/projects/plan.txt` → **denied** (bob is "other" on 660) | bob reads `/projects/confidential/flag.txt` → **denied** (both) |
+
+### Auditing
+
+Every decision is appended as one JSON line to `server/audit.jsonl`. This covers policy
+decisions, requests stopped by the jail, and logins. The fields are `timestamp` (UTC), `user`,
+`op`, `path`, `allowed` and `reason`. Passwords are never logged. Sample:
+
+```
+{"timestamp": "2026-11-22T18:53:11+00:00", "user": "alice", "op": "read", "path": "/projects/confidential/flag.txt", "allowed": false, "reason": "denied: MAC: no read up (internal -> confidential)"}
+{"timestamp": "2026-11-22T18:53:12+00:00", "user": "bob", "op": "write", "path": "/projects/confidential/flag.txt", "allowed": false, "reason": "denied: DAC: other lacks 0o2 on /projects/confidential (file mode 0o660)"}
+{"timestamp": "2026-11-22T18:53:10+00:00", "user": "eve", "op": "read", "path": "/../../server/data/users.json", "allowed": false, "reason": "path escapes the jail"}
+```
+
+### Self-tests
+
+The tests are in [tests/test_sftp.py](tests/test_sftp.py) and [tests/test_client.py](tests/test_client.py).
+Each test has a one-line docstring with its objective and builds its own fixtures (temporary jail,
+users, roles and labels). Run them with `python -m pytest -v`.
+
+| Area | Tests |
+|------|-------|
+| DAC | `test_dac_owner_read_write_and_other_denied`, `test_dac_directory_execute_controls_listing` |
+| MAC | `test_mac_no_read_up_and_no_write_down` |
+| RBAC | `test_rbac_analyst_scope_role_union_and_deny_override` |
+| Composite | `test_composite_dac_allows_mac_denies`, `test_composite_mac_allows_dac_denies`, `test_composite_all_allow` |
+| Traversal | `test_traversal_denied_before_policy_and_audited`, `test_canonicalize_refuses_escapes`, `test_safe_join_refuses_symlink` |
+| Audit | `test_eve_cannot_read_confidential`, `test_composite_all_allow`, `test_traversal_denied_before_policy_and_audited`, `test_sftp_end_to_end`, `test_sftp_end_to_end_real_policy` |
+| End to end, several users | `test_sftp_end_to_end_real_policy`, `test_only_carol_reads_the_flag` |
 
 ## Authentication
 
@@ -199,11 +386,7 @@ Login lines have `"op": "login"` and no path. Sample, from a real run:
 {"timestamp": "2026-11-19T18:17:02+00:00", "user": "eve", "op": "login", "path": null, "allowed": false, "reason": "account locked"}
 ```
 
-An access decision looks the same (this one is only an example of the format):
-
-```
-{"timestamp": "...", "user": "eve", "op": "read", "path": "/projects/confidential/x", "allowed": false, "reason": "..."}
-```
+Access decisions use the same fields. See the samples under [Auditing](#auditing) above.
 
 ## CTF
 
@@ -230,7 +413,7 @@ before policy by `canonicalize()` and `safe_join()`. To try the attacks yourself
 python ctf/attack.py --username eve
 ```
 
-It runs 24 attempts (traversal, aliasing, forged and reused handles, symlink, rename, write through a read handle)
+It runs 18 attempts (traversal, aliasing, forged and reused handles, symlink, rename, write through a read handle)
 and prints which ones were blocked. The full story is in `CTF_writeup.pdf`.
 
 ## Known limitations
@@ -245,4 +428,7 @@ and prints which ones were blocked. The full story is in `CTF_writeup.pdf`.
 
 ## Use of generative AI
 
-AI was used to generate the users.json file, and review/adjust loader.py and auth.py files.
+AI tools were used to review code contributions from group members, and to create `users.json` and the
+`README.md`. AI was also used to update and adjust the test files and the server files, with some updates to
+`ctf/attack.py`. AI was used as a collaborative tool for better teamwork and project comprehension, and all
+AI-assisted code and writeup was reviewed by the group.
